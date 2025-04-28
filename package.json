@@ -1,0 +1,17 @@
+{
+  "name": "bdap-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "BOCRA API Integration for subscriber data",
+  "main": "Server.js",
+  "scripts": {
+    "start": "node scheduler.js",
+    "test": "node test-script.js",
+    "demo": "node demo.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3"
+  }
+}
