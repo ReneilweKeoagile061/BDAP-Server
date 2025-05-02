@@ -11,6 +11,10 @@ import axios from 'axios';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
 import os from 'os';
+import https from 'https';
+
+// Add fs regular import for the natural subscriber implementation
+import fs_regular from 'fs';
 
 console.log('Starting application...');
 
@@ -24,6 +28,12 @@ const BASE_URL = 'https://simsapi.bocra.org.bw';  // API base URL
 const API_KEY = 'BC.bUk37gtNG5w9T422BYAxHrlXITP32iFi.LuAZLfAhCDL4V235eXdhbKNzI/QXvDh7fTO5W8a/NZA=';  // API authentication key
 const SSH_KEY_PATH = path.join(os.homedir(), '.ssh', 'id_rsa');  // Path to SSH key for BDAP server authentication
 const NATURAL_API_URL = 'https://simsapi.bocra.org.bw/api/v1/natural_subscribers/mno/verification';  // Endpoint for natural subscribers
+
+// Constants for natural subscriber implementation
+const DEFAULT_CONTACT = "+26773001762";
+const NATURAL_BASE_URL = 'https://simsapi.bocra.org.bw/api/v1/natural_subscribers/mno/verification';
+const NATURAL_OUTPUT_DIR = "resources/";
+const DATE_RANGE = '/start/01-01-2022/end/01-01-2026';
 
 // Log SSH key path for debugging
 console.log('Using SSH key:', SSH_KEY_PATH);
@@ -59,8 +69,10 @@ const TEST_MSISDN = '73005659';     // Test MSISDN (phone number) for lookups
 // Data collection configuration
 const HISTORICAL_START_DATE = '2022-01-01';  // Starting date for historical data collection
 const HISTORICAL_END_DATE = new Date().toISOString().split('T')[0]; // Current date as end date
-const PAGE_SIZE = 2000;  // Number of records to fetch per page
-const MAX_PAGES = 3;     // Maximum number of pages to fetch per subscriber type/state
+const PAGE_SIZE = 20;    // Reduced from 2000 to 20 to match Python implementation
+const MAX_PAGES = 3;     // Maximum number of pages for testing
+const MAX_PAGES_FULL = 1000; // Maximum number of pages for production (effectively unlimited)
+const DISABLE_DATE_FILTERING = false; // Changed back to false - we'll use date filtering with correct format
 
 // MSISDN range and retry configuration
 const MSISDN_START = 70000000; // Starting MSISDN range for Botswana
@@ -70,18 +82,173 @@ const MAX_RETRIES = 3;         // Maximum number of retry attempts
 const RETRY_DELAY = 5000;      // Delay between retries (5 seconds)
 const CONNECTION_TIMEOUT = 30000; // Connection timeout (30 seconds)
 
+// Create a dedicated API client for natural subscribers based on exact implementation from user
+const naturalApiClient = axios.create({
+    headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY
+    },
+    timeout: 30000,
+});
+
+// Functions for natural subscriber processing exactly as provided
+async function writeToFileNatural(filePath, content) {
+    // Ensure output directory exists
+    if (!fs_regular.existsSync(NATURAL_OUTPUT_DIR)) {
+        fs_regular.mkdirSync(NATURAL_OUTPUT_DIR);
+    }
+    await fs_regular.promises.appendFile(filePath, content + "\n", "utf-8");
+}
+
+async function withRetryNatural(fn, retries = 3) {
+    try {
+        return await fn();
+    } catch (error) {
+        if (retries > 0) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return withRetryNatural(fn, retries - 1);
+        }
+        throw error;
+    }
+}
+
+async function safeSendNotificationNatural(message, contact) {
+    try {
+        // await sendNotification(message, contact);
+        console.log(`Sending ${message} to ${contact}`);
+    } catch (error) {
+        console.error('Failed to send notification:', error);
+    }
+}
+
+// Natural subscriber download implementation exactly as provided
+async function downloadNaturalSubscribers(config) {
+    const { status, fileNamePrefix, notificationContact = DEFAULT_CONTACT } = config;
+    const contact = notificationContact;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `${fileNamePrefix}_${timestamp}.csv`;
+    const filePath = path.join(NATURAL_OUTPUT_DIR, filename);
+
+    try {
+        await safeSendNotificationNatural(`Starting download for ${status} subscribers`, contact);
+
+        // Initialize CSV file
+        const initialRow = 'firstname,lastname,dateOfBirth,country,documentType,documentNumber,expiryDate,dateOfIssue,sex,state,updated,msisdn,naturalSubscriber,juristicSubscriber,registrationNumber,verificationReason,verificationState';
+        await writeToFileNatural(filePath, initialRow)
+
+        // Fetch initial data to get pagination details
+        const initialResponse = await withRetryNatural(() =>
+            naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=20`)
+            // naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000`)
+        );
+
+        const totalPages = 3;
+        // const totalPages = initialResponse.data.pages;
+        console.log(`Processing ${totalPages} pages of ${status} subscribers`);
+
+        // Process all pages
+        for (let currentPage = 0; currentPage < totalPages; currentPage++) {
+            try {
+                console.log(`Processing page ${currentPage + 1}/${totalPages}`);
+                const pageData = await withRetryNatural(() =>
+                    // naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=20&page=${currentPage}`)
+                    naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000&page=${currentPage}`)
+                );
+
+                if (!pageData.data.content?.length) {
+                    console.log(`No content found in page ${currentPage}`);
+                    continue;
+                }
+
+                const records = pageData.data.content.flatMap(subscriber =>
+                    subscriber.numbers.map(number => ({
+                        firstname: subscriber.firstName,
+                        lastname: subscriber.lastName,
+                        dateOfBirth: subscriber.dateOfBirth,
+                        country: subscriber.country,
+                        documentType: subscriber.subscriberDocuments[0]?.documentType || '',
+                        documentNumber: subscriber.subscriberDocuments[0]?.documentNumber || '',
+                        expiryDate: subscriber.subscriberDocuments[0]?.expiryDate || '',
+                        dateOfIssue: subscriber.subscriberDocuments[0]?.dateOfIssue || '',
+                        sex: subscriber.sex,
+                        state: number.state,
+                        updated: subscriber.updated,
+                        msisdn: number.msisdn,
+                        naturalSubscriber: number.naturalSubscriber,
+                        juristicSubscriber: number.juristicSubscriber,
+                        registrationNumber: number.registrationNumber,
+                        verificationReason: subscriber.verificationReason,
+                        verificationState: subscriber.verificationState
+                    }))
+                );
+
+                records.map((record) => {
+                    const row = `${record.firstname},${record.lastname}, ${record.dateOfBirth}, ${record.country}, ${record.documentType}, ${record.documentNumber}, ${record.expiryDate},${record.dateOfIssue}, ${record.sex}, ${record.state}, ${record.updated},${record.msisdn},${record.naturalSubscriber},${record.juristicSubscriber},${record.registrationNumber},${record.verificationReason},${record.verificationState}`;
+                    writeToFileNatural(filePath, row);
+                })
+
+            } catch (pageError) {
+                console.error(`Error processing page ${currentPage}:`, pageError);
+                await safeSendNotificationNatural(`Error processing page ${currentPage} for ${status} subscribers`, contact);
+            }
+        }
+
+        await safeSendNotificationNatural(`Successfully downloaded ${status} subscribers`, contact);
+        console.log(`Completed download for ${status} subscribers at: ${filePath}`);
+        return filePath;
+
+    } catch (error) {
+        console.error(`Critical error processing ${status} subscribers:`, error);
+        await safeSendNotificationNatural(`Failed to download ${status} subscribers - contact support`, contact);
+        throw error;
+    } finally {
+        // if (fileHandle) {
+        //     await fileHandle.close();
+        // }
+    }
+}
+
+// Export functions exactly as provided
+export const downloadAllFailedNaturalSubscribers = async (notificationContact) => {
+    return downloadNaturalSubscribers({
+        status: 'FAILED_VERIFICATION',
+        fileNamePrefix: 'failed_natural-subscriber',
+        notificationContact
+    });
+}
+
+export const downloadAllVerifiedNaturalSubscribers = async (notificationContact) => {
+    return downloadNaturalSubscribers({
+        status: 'VERIFIED',
+        fileNamePrefix: 'verified_natural-subscriber',
+        notificationContact
+    });
+}
+
+export const downloadAllPendingNaturalSubscribers = async (notificationContact) => {
+    return downloadNaturalSubscribers({
+        status: 'PENDING_VERIFICATION',
+        fileNamePrefix: 'pending_natural-subscriber',
+        notificationContact
+    });
+}
+
 /**
  * Configure Axios instance for API requests
  * Sets up base URL, timeout, and authentication headers
  */
 const api = axios.create({
     baseURL: BASE_URL,
-    timeout: 30000,
+    timeout: 120000,
     headers: {
         'x-api-key': API_KEY,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
-    }
+    },
+    // Disable SSL verification to match Python implementation
+    httpsAgent: new https.Agent({
+        rejectUnauthorized: false
+    })
 });
 
 /**
@@ -306,140 +473,275 @@ async function fetchAllSubscribers(verificationState = null, type = 'natural', f
             
             const startDate = formatDateForApi(HISTORICAL_START_DATE);
             const endDate = formatDateForApi(HISTORICAL_END_DATE);
+            
+            // Use exact date range format from Python code
             const dateRange = `/start/${startDate}/end/${endDate}`;
             
-            console.log(`Using date range: ${dateRange}`);
+            console.log(`Using Python-matched date range: ${dateRange}`);
+            console.log(`Date filtering disabled: ${DISABLE_DATE_FILTERING}`);
+            
+            // Add variable to track if any state processed successfully
+            let anyStateSuccessful = false;
             
             // Process each verification state
             for (const state of statesToProcess) {
                 console.log("\n========== Processing " + state + " natural subscribers ==========");
                 
-                // Build URL exactly like the TypeScript code
-                const fullUrl = `${NATURAL_API_URL}/${state}${dateRange}`;
-                console.log("Using TypeScript-matched URL: " + fullUrl);
+                // Try alternative endpoints if main endpoint fails with Python's exact URL structure
+                let endpointsToTry = [];
                 
-                // Initialize pagination variables
-                let currentPage = 0;
-                const pageSize = 2000;
-                let totalPages = 1;
-                let pagesFetched = 0;
+                if (DISABLE_DATE_FILTERING) {
+                    endpointsToTry = [
+                        `/api/v1/natural_subscribers/mno/verification/${state}`,
+                        `/api/v1/natural_subscribers/${state}`,
+                        `/api/v1/natural_subscribers/verification/${state}`
+                    ];
+                } else {
+                    // Primary endpoint exactly matching Python's approach (status before date range)
+                    endpointsToTry = [
+                        `/api/v1/natural_subscribers/mno/verification/${state}${dateRange}`
+                    ];
+                }
                 
-                // Process pages up to the configured limit
-                while (currentPage < totalPages && pagesFetched < MAX_PAGES) {
+                let endpointSuccess = false;
+                
+                for (const fullUrl of endpointsToTry) {
+                    if (endpointSuccess) break;
+                    
+                    console.log(`Trying Python-matched endpoint: ${fullUrl}`);
+                    
                     try {
-                        console.log(`Fetching page ${currentPage + 1} for state ${state}...`);
+                        // Initialize pagination variables
+                        let currentPage = 0;
+                        const pageSize = PAGE_SIZE; // Using smaller pageSize (20) to match Python
+                        let totalPages = 1;
+                        let pagesFetched = 0;
                         
-                        // Build query parameters for pagination
-                        const params = {
-                            page: currentPage,
-                            size: pageSize
-                        };
-                        
-                        console.log(`Request URL: ${fullUrl}`);
-                        console.log(`Request params: ${JSON.stringify(params)}`);
-                        
-                        // Make the API request
-                        const response = await api.get(fullUrl, {
-                            params,
-                            timeout: 60000  // 60-second timeout for potentially large responses
-                        });
-                        
-                        console.log(`Response status for page ${currentPage + 1}, state ${state}: ${response.status}`);
-                        
-                        // Validate response data
-                        if (!response.data) {
-                            console.warn(`Warning: No data received for page ${currentPage + 1}, state ${state}.`);
-                            break; // Stop processing pages for this state if no data is returned
-                        }
-                        
-                        if (response.data.error) {
-                            console.error(`API Error for page ${currentPage + 1}, state ${state}:`, response.data.error);
-                            break; // Stop processing pages for this state on API error
-                        }
-                        
-                        // Process the subscriber data if it has the expected structure
-                        if (response.data.content && Array.isArray(response.data.content)) {
-                            // Update total pages on first successful request for this state
-                            if (currentPage === 0) {
-                                totalPages = response.data.pages || 1;
-                                console.log(`Total pages for state ${state}: ${totalPages}`);
-                            }
-                            
-                            const subscribers = response.data.content;
-                            // Log empty content for debugging
-                            if (subscribers.length === 0) {
-                                console.log(`---> Page ${currentPage + 1} for state ${state} returned 0 subscribers (empty content array).`);
-                                console.log('Full response data for empty content:', JSON.stringify(response.data, null, 2));
-                            }
-                            console.log(`Processing ${subscribers.length} subscribers from page ${currentPage + 1}, state ${state}`);
-                            
-                            // Process each subscriber record
-                            for (const subscriber of subscribers) {
-                                // Each subscriber may have multiple phone numbers
-                                if (subscriber.numbers && Array.isArray(subscriber.numbers)) {
-                                    subscriber.numbers.forEach(number => {
-                                        // Create standardized record format for each number
-                                        const record = {
-                                            msisdn: number.msisdn,
-                                            subscriber_id: subscriber.id,
-                                            subscriber_type: 'natural',
-                                            number_state: number.state,
-                                            subscriber_verification_state: subscriber.verificationState,
-                                            subscriber_verification_reason: subscriber.verificationReason,
-                                            first_name: subscriber.firstName,
-                                            last_name: subscriber.lastName,
-                                            date_of_birth: subscriber.dateOfBirth,
-                                            registration_date: '',
-                                            registration_number: '',
-                                            country: subscriber.country,
-                                            sex: subscriber.sex,
-                                            document_type: subscriber.subscriberDocuments?.[0]?.documentType,
-                                            document_number: subscriber.subscriberDocuments?.[0]?.documentNumber,
-                                            document_issue_date: subscriber.subscriberDocuments?.[0]?.dateOfIssue,
-                                            document_expiry_date: subscriber.subscriberDocuments?.[0]?.expiryDate,
-                                            address_plot: subscriber.addresses?.[0]?.plotWardBox,
-                                            address_city: subscriber.addresses?.[0]?.cityTown,
-                                            created_date: subscriber.created,
-                                            updated_date: subscriber.updated
-                                        };
-                                        results.add(JSON.stringify(record));
-                                    });
+                        // Process pages up to the configured limit
+                        while (currentPage < totalPages && pagesFetched < MAX_PAGES) {
+                            try {
+                                console.log(`Fetching page ${currentPage + 1} for state ${state}...`);
+                                
+                                // Build query parameters for pagination
+                                const params = {
+                                    page: currentPage,
+                                    size: pageSize
+                                };
+                                
+                                console.log(`Request URL: ${fullUrl}`);
+                                console.log(`Request params: ${JSON.stringify(params)}`);
+                                
+                                // Make the API request
+                                const response = await api.get(fullUrl, {
+                                    params,
+                                    timeout: 120000  // 2-minute timeout for potentially large responses
+                                });
+                                
+                                console.log(`Response status for page ${currentPage + 1}, state ${state}: ${response.status}`);
+                                
+                                // Validate response data
+                                if (!response.data) {
+                                    console.warn(`Warning: No data received for page ${currentPage + 1}, state ${state}.`);
+                                    break; // Stop processing pages for this state if no data is returned
                                 }
+                                
+                                if (response.data.error) {
+                                    console.error(`API Error for page ${currentPage + 1}, state ${state}:`, response.data.error);
+                                    break; // Stop processing pages for this state on API error
+                                }
+                                
+                                // Add detailed logging for data structure
+                                console.log(`DETAILED DATA STRUCTURE for ${state}:`, {
+                                    responseKeys: Object.keys(response.data),
+                                    hasContent: !!response.data.content,
+                                    contentLength: response.data.content ? response.data.content.length : 0,
+                                    firstItem: response.data.content && response.data.content.length > 0 ? 
+                                             JSON.stringify(response.data.content[0]).substring(0, 500) : "No items",
+                                    totalPages: response.data.pages || 0,
+                                    totalElements: response.data.totalElements || 0
+                                });
+                                
+                                // If we have data but not in expected structure, try to handle it
+                                if (!response.data.content || !Array.isArray(response.data.content)) {
+                                    // Try to handle alternative response structures
+                                    console.log('Attempting to parse alternative response structure');
+                                    
+                                    // Common alternatives:
+                                    // 1. Direct array of subscribers
+                                    if (Array.isArray(response.data)) {
+                                        console.log('Found array response structure');
+                                        response.data = { 
+                                            content: response.data,
+                                            pages: 1
+                                        };
+                                    } 
+                                    // 2. Data wrapped in 'data' field
+                                    else if (response.data.data && (Array.isArray(response.data.data) || response.data.data.content)) {
+                                        console.log('Found data field structure');
+                                        if (Array.isArray(response.data.data)) {
+                                            response.data = {
+                                                content: response.data.data,
+                                                pages: 1
+                                            };
+                                        } else {
+                                            response.data = response.data.data;
+                                        }
+                                    }
+                                    // 3. Data in 'subscribers' field
+                                    else if (response.data.subscribers && Array.isArray(response.data.subscribers)) {
+                                        console.log('Found subscribers field structure');
+                                        response.data = {
+                                            content: response.data.subscribers,
+                                            pages: 1
+                                        };
+                                    }
+                                    // If still no valid content structure
+                                    if (!response.data.content || !Array.isArray(response.data.content)) {
+                                        console.warn(`Warning: Could not parse response structure for state ${state}`);
+                                        console.log('Response keys:', Object.keys(response.data));
+                                        break;
+                                    }
+                                }
+                                
+                                // Process the subscriber data if it has the expected structure
+                                if (response.data.content && Array.isArray(response.data.content)) {
+                                    // Update total pages on first successful request for this state
+                                    if (currentPage === 0) {
+                                        totalPages = response.data.pages || 1;
+                                        console.log(`Total pages for state ${state}: ${totalPages}`);
+                                    }
+                                    
+                                    const subscribers = response.data.content;
+                                    // Log empty content for debugging
+                                    if (subscribers.length === 0) {
+                                        console.log(`---> Page ${currentPage + 1} for state ${state} returned 0 subscribers (empty content array).`);
+                                        console.log('Full response data for empty content:', JSON.stringify(response.data, null, 2));
+                                    }
+                                    console.log(`Processing ${subscribers.length} subscribers from page ${currentPage + 1}, state ${state}`);
+                                    
+                                    // Store current result size to track new additions
+                                    const previousResultSize = results.size;
+                                    
+                                    let subscribersWithNumbers = 0;
+                                    let totalNumbers = 0;
+                                    
+                                    // Process each subscriber record
+                                    for (const subscriber of subscribers) {
+                                        // Each subscriber may have multiple phone numbers
+                                        if (subscriber.numbers && Array.isArray(subscriber.numbers) && subscriber.numbers.length > 0) {
+                                            subscribersWithNumbers++;
+                                            totalNumbers += subscriber.numbers.length;
+                                            
+                                            subscriber.numbers.forEach(number => {
+                                                // Create standardized record format for each number, using Python field names where possible
+                                                const record = {
+                                                    msisdn: number.msisdn,
+                                                    subscriber_id: subscriber.id,
+                                                    subscriber_type: 'natural',
+                                                    number_state: number.state,
+                                                    subscriber_verification_state: subscriber.verificationState,
+                                                    subscriber_verification_reason: subscriber.verificationReason,
+                                                    first_name: subscriber.firstName,
+                                                    last_name: subscriber.lastName,
+                                                    date_of_birth: subscriber.dateOfBirth,
+                                                    registration_date: '',
+                                                    registration_number: number.registrationNumber || '',
+                                                    country: subscriber.country,
+                                                    sex: subscriber.sex,
+                                                    document_type: subscriber.subscriberDocuments?.[0]?.documentType,
+                                                    document_number: subscriber.subscriberDocuments?.[0]?.documentNumber,
+                                                    document_issue_date: subscriber.subscriberDocuments?.[0]?.dateOfIssue,
+                                                    document_expiry_date: subscriber.subscriberDocuments?.[0]?.expiryDate,
+                                                    address_plot: subscriber.addresses?.[0]?.plotWardBox,
+                                                    address_city: subscriber.addresses?.[0]?.cityTown,
+                                                    created_date: subscriber.created,
+                                                    updated_date: subscriber.updated
+                                                };
+                                                results.add(JSON.stringify(record));
+                                                
+                                                // Also create a Python-compatible format to help debug
+                                                const pythonRecord = {
+                                                    firstname: subscriber.firstName || '',
+                                                    lastname: subscriber.lastName || '',
+                                                    dateOfBirth: subscriber.dateOfBirth || '',
+                                                    country: subscriber.country || '',
+                                                    documentType: subscriber.subscriberDocuments?.[0]?.documentType || '',
+                                                    documentNumber: subscriber.subscriberDocuments?.[0]?.documentNumber || '',
+                                                    expiryDate: subscriber.subscriberDocuments?.[0]?.expiryDate || '',
+                                                    dateOfIssue: subscriber.subscriberDocuments?.[0]?.dateOfIssue || '',
+                                                    sex: subscriber.sex || '',
+                                                    state: number.state || '',
+                                                    updated: subscriber.updated || '',
+                                                    msisdn: number.msisdn || '',
+                                                    naturalSubscriber: number.naturalSubscriber || '',
+                                                    juristicSubscriber: number.juristicSubscriber || '',
+                                                    registrationNumber: number.registrationNumber || '',
+                                                    verificationReason: subscriber.verificationReason || '',
+                                                    verificationState: subscriber.verificationState || ''
+                                                };
+                                                
+                                                // Log a sample record for debugging
+                                                if (results.size === 1) {
+                                                    console.log('Sample Python-compatible record:', JSON.stringify(pythonRecord, null, 2));
+                                                }
+                                            });
+                                        } else {
+                                            console.log(`WARNING: Subscriber without numbers or empty numbers array: ${JSON.stringify(subscriber).substring(0, 300)}...`);
+                                        }
+                                    }
+                                    
+                                    console.log(`SUMMARY for page ${currentPage + 1}, state ${state}:`);
+                                    console.log(`- Total subscribers: ${subscribers.length}`);
+                                    console.log(`- Subscribers with numbers: ${subscribersWithNumbers}`);
+                                    console.log(`- Total MSISDN numbers: ${totalNumbers}`);
+                                    console.log(`- Records added: ${results.size - previousResultSize}`);
+                                    
+                                    currentPage++;
+                                    pagesFetched++;
+                                    console.log(`Processed ${results.size} total records so far (across all states)`);
+                                    
+                                } else {
+                                    // Handle unexpected response structure
+                                    console.warn(`Warning: Unexpected response structure for page ${currentPage + 1}, state ${state}. Keys:`, Object.keys(response.data));
+                                    console.log('Full response data for unexpected structure:', JSON.stringify(response.data, null, 2));
+                                    break; // Stop processing pages for this state
+                                }
+                                
+                            } catch (error) {
+                                // Handle critical errors during API request
+                                console.error(`!!!!!!!! CRITICAL ERROR fetching page ${currentPage + 1} for state ${state} !!!!!!!!!!`);
+                                if (axios.isAxiosError(error)) {
+                                    console.error('Axios Error Details:', {
+                                        message: error.message,
+                                        code: error.code,
+                                        status: error.response?.status,
+                                        responseData: error.response?.data
+                                    });
+                                } else {
+                                    console.error('Non-Axios Error:', error);
+                                }
+                                console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
+                                break; // Stop processing pages for this state on critical error
                             }
-                            
-                            currentPage++;
-                            pagesFetched++;
-                            console.log(`Processed ${results.size} total records so far (across all states)`);
-                            
-                        } else {
-                            // Handle unexpected response structure
-                            console.warn(`Warning: Unexpected response structure for page ${currentPage + 1}, state ${state}. Keys:`, Object.keys(response.data));
-                            console.log('Full response data for unexpected structure:', JSON.stringify(response.data, null, 2));
-                            break; // Stop processing pages for this state
+                        }
+                        
+                        // If this endpoint was successful in retrieving data, mark as successful and stop trying other endpoints
+                        if (results.size > 0) {
+                            endpointSuccess = true;
+                            anyStateSuccessful = true;
                         }
                         
                     } catch (error) {
-                        // Handle critical errors during API request
-                        console.error(`!!!!!!!! CRITICAL ERROR fetching page ${currentPage + 1} for state ${state} !!!!!!!!!!`);
-                        if (axios.isAxiosError(error)) {
-                            console.error('Axios Error Details:', {
-                                message: error.message,
-                                code: error.code,
-                                status: error.response?.status,
-                                responseData: error.response?.data
-                            });
-                        } else {
-                            console.error('Non-Axios Error:', error);
-                        }
-                        console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
-                        break; // Stop processing pages for this state on critical error
+                        console.error(`Failed to process endpoint ${fullUrl}:`, error.message);
+                        // Continue to next endpoint
                     }
                 }
-                
-                // Log if we've reached the page limit
-                if (pagesFetched >= MAX_PAGES && totalPages > MAX_PAGES) {
-                    console.log(`Reached maximum page limit (${MAX_PAGES}) for state ${state}. Skipping remaining ${totalPages - pagesFetched} pages.`);
-                }
+            }
+            
+            // If all endpoints failed, try the MSISDN range method as a last resort
+            if (!anyStateSuccessful) {
+                console.log("\n========== No endpoints successful. Throwing error ==========");
+                throw new Error(`ERROR: Failed to fetch ${type} subscribers with state(s): ${statesToProcess.join(', ')}. All API endpoints failed.`);
             }
             
             console.log(`Completed natural subscribers fetch. Found ${results.size} records.`);
@@ -729,97 +1031,153 @@ async function fetchSubscribersByMsisdnRange(verificationState = null) {
  */
 async function downloadSubscribers(config = {}) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const partitionPath = await getDatePartitionedPath(config.date || new Date());
+    const {
+        subscriberTypes = ['natural', 'juristic'],
+        verificationStates = ['VERIFIED', 'FAILED_VERIFICATION', 'PENDING_VERIFICATION'],
+        fromDate = HISTORICAL_START_DATE,
+        notificationContact = DEFAULT_CONTACT
+    } = config;
     
-    // CSV header
-    const header = [
-        'msisdn',
-        'subscriber_id',
-        'subscriber_type',
-        'number_state',
-        'subscriber_verification_state',
-        'subscriber_verification_reason',
-        'first_name',
-        'last_name',
-        'date_of_birth',
-        'registration_date',
-        'registration_number',
-        'country',
-        'sex',
-        'document_type',
-        'document_number',
-        'document_issue_date',
-        'document_expiry_date',
-        'address_plot',
-        'address_city',
-        'created_date',
-        'updated_date'
-    ].join(',') + '\n';
+    console.log('Starting downloadSubscribers function with config:', {
+        subscriberTypes,
+        verificationStates,
+        fromDate,
+        timestampUsed: timestamp
+    });
 
-    const verificationStates = ['ACTIVE', 'FAILED', 'PENDING'];
-    const subscriberTypes = ['natural', 'juristic'];
-    let totalProcessed = 0;
-    const startTime = Date.now();
-    const outputFiles = {};
-    const results = {};
-
-    console.log("\n=============== Creating output files ===============");
-    // Create files for each type
-    for (const state of verificationStates) {
-        const fileName = path.join(partitionPath, `natural_${state.toLowerCase()}_${timestamp}.csv`);
-        outputFiles[`natural_${state}`] = fileName;
-        results[`natural_${state}`] = new Set();
-        await fs.writeFile(fileName, header);
-        console.log(`Created file for ${state} natural subscribers:`, fileName);
-    }
-
-    // Create juristic file
-    const juristicFileName = path.join(partitionPath, `juristic_all_${timestamp}.csv`);
-    outputFiles['juristic'] = juristicFileName;
-    results['juristic'] = new Set();
-    await fs.writeFile(juristicFileName, header);
-    console.log('Created file for juristic subscribers:', juristicFileName);
-
-    // Process each subscriber type
-    for (const type of subscriberTypes) {
-        console.log(`\nProcessing ${type} subscribers...`);
-        
-        if (type === 'natural') {
-            // Process natural subscribers by verification state
-            for (const state of verificationStates) {
-                try {
-                    console.log(`\n---------> Attempting to fetch state: ${state} <---------`);
-                    const stateResults = await fetchAllSubscribers(state, type);
-                    
-                    // Add to appropriate result set
-                    stateResults.forEach(result => results[`natural_${state}`].add(result));
-                    totalProcessed += stateResults.size;
-                    
-                    // Log progress
-                    const elapsed = (Date.now() - startTime) / 1000;
-                    console.log(`Progress: ${totalProcessed} total records processed in ${elapsed.toFixed(1)}s`);
-                    
-                    // Write batch to appropriate file
-                    console.log(`Writing ${stateResults.size} ${state} natural subscribers to file...`);
-                    for (const resultStr of stateResults) {
-                        const record = JSON.parse(resultStr);
-                        const line = Object.values(record)
-                            .map(field => `"${String(field || '').replace(/"/g, '""')}"`)
-                            .join(',') + '\n';
-                        await fs.appendFile(outputFiles[`natural_${state}`], line);
-                    }
-                } catch (error) {
-                    console.error(`Error processing ${type} subscribers with ${state} verification state:`, error.message);
-                }
-            }
-        } else {
-            // Process juristic subscribers (leave this as is)
+    // Create output directories
+    const outputPath = await getDatePartitionedPath();
+    console.log('Using output path:', outputPath);
+    
+    // Track generated files
+    const generatedFiles = [];
+    
+    // First, handle natural subscribers using the implementation from server_2.js
+    if (subscriberTypes.includes('natural')) {
+        for (const status of verificationStates) {
             try {
-                console.log(`\nFetching all juristic subscribers...`);
-                const stateResults = await fetchAllSubscribers(null, type);
+                console.log(`Processing natural subscribers with status: ${status}`);
+                const outputFilename = `${status.toLowerCase()}_natural-subscriber_${timestamp}.csv`;
+                const filePath = path.join(outputPath, outputFilename);
                 
-                // Process and validate each juristic record
-                for (const resultStr of stateResults) {
+                // Initialize CSV file
+                const initialRow = 'firstname,lastname,dateOfBirth,country,documentType,documentNumber,expiryDate,dateOfIssue,sex,state,updated,msisdn,naturalSubscriber,juristicSubscriber,registrationNumber,verificationReason,verificationState';
+                await writeToFile(filePath, initialRow);
+                
+                // Send notification
+                await safeSendNotification(`Starting download for ${status} natural subscribers`, notificationContact);
+                
+                // Fetch initial data to get pagination details
+                const initialResponse = await withRetry(() =>
+                    naturalApiClient.get(`/api/v1/natural_subscribers/mno/verification/${status}${DATE_RANGE}?size=2000`)
+                );
+                
+                // Get total pages from response or use default
+                const totalPages = initialResponse.data.pages || 3;
+                console.log(`Processing ${totalPages} pages of ${status} natural subscribers`);
+                let recordCount = 0;
+                
+                // Process all pages
+                for (let currentPage = 0; currentPage < Math.min(totalPages, MAX_PAGES); currentPage++) {
+                    try {
+                        console.log(`Processing page ${currentPage + 1}/${Math.min(totalPages, MAX_PAGES)}`);
+                        const pageData = await withRetry(() =>
+                            naturalApiClient.get(`/api/v1/natural_subscribers/mno/verification/${status}${DATE_RANGE}?size=2000&page=${currentPage}`)
+                        );
+                        
+                        if (!pageData.data.content?.length) {
+                            console.log(`No content found in page ${currentPage}`);
+                            continue;
+                        }
+                        
+                        const records = pageData.data.content.flatMap(subscriber =>
+                            subscriber.numbers.map(number => ({
+                                firstname: subscriber.firstName || '',
+                                lastname: subscriber.lastName || '',
+                                dateOfBirth: subscriber.dateOfBirth || '',
+                                country: subscriber.country || '',
+                                documentType: subscriber.subscriberDocuments?.[0]?.documentType || '',
+                                documentNumber: subscriber.subscriberDocuments?.[0]?.documentNumber || '',
+                                expiryDate: subscriber.subscriberDocuments?.[0]?.expiryDate || '',
+                                dateOfIssue: subscriber.subscriberDocuments?.[0]?.dateOfIssue || '',
+                                sex: subscriber.sex || '',
+                                state: number.state || '',
+                                updated: subscriber.updated || '',
+                                msisdn: number.msisdn || '',
+                                naturalSubscriber: number.naturalSubscriber || '',
+                                juristicSubscriber: number.juristicSubscriber || '',
+                                registrationNumber: number.registrationNumber || '',
+                                verificationReason: subscriber.verificationReason || '',
+                                verificationState: subscriber.verificationState || ''
+                            }))
+                        );
+                        
+                        // Format and write records
+                        for (const record of records) {
+                            // Clean values to prevent CSV corruption
+                            const cleanedValues = Object.values(record).map(value => 
+                                String(value || '').replace(/,/g, ';').replace(/[\r\n]/g, ' ')
+                            );
+                            const row = cleanedValues.join(',');
+                            await writeToFile(filePath, row);
+                            recordCount++;
+                        }
+                        
+                        console.log(`Processed ${records.length} records from page ${currentPage + 1}`);
+                        
+                    } catch (pageError) {
+                        console.error(`Error processing page ${currentPage} for ${status}:`, pageError.message);
+                        await safeSendNotification(`Error processing page ${currentPage} for ${status} natural subscribers`, notificationContact);
+                    }
+                }
+                
+                console.log(`Completed download for ${status} natural subscribers: ${recordCount} records`);
+                generatedFiles.push({
+                    type: 'natural',
+                    status,
+                    path: filePath,
+                    recordCount
+                });
+                
+                // Upload the file to BDAP
+                try {
+                    await uploadToBDAP(filePath);
+                    console.log(`Successfully uploaded ${status} natural subscribers file to BDAP`);
+                } catch (uploadError) {
+                    console.error(`Error uploading ${status} natural subscribers file:`, uploadError.message);
+                }
+                
+            } catch (error) {
+                console.error(`Critical error processing ${status} natural subscribers:`, error.message);
+                await safeSendNotification(`Failed to download ${status} natural subscribers - contact support`, notificationContact);
+            }
+        }
+    }
+    
+    // Now, continue with the original juristic subscribers logic
+    if (subscriberTypes.includes('juristic')) {
+        try {
+            console.log('\nProcessing juristic subscribers...');
+            const outputFilename = `juristic_all_${timestamp}.csv`;
+            const filePath = path.join(outputPath, outputFilename);
+            
+            // Initialize CSV file with appropriate header
+            const juristicHeader = 'msisdn,subscriber_id,subscriber_type,number_state,subscriber_verification_state,subscriber_verification_reason,first_name,last_name,date_of_birth,registration_date,registration_number,country,sex,document_type,document_number,document_issue_date,document_expiry_date,address_plot,address_city,created_date,updated_date';
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(filePath, juristicHeader + '\n', 'utf-8');
+            
+            console.log(`Starting download for juristic subscribers to ${DEFAULT_CONTACT}`);
+            
+            // Fetch juristic subscribers
+            console.log('Fetching all juristic subscribers...');
+            const juristicResults = await fetchAllSubscribers(null, 'juristic');
+            let recordCount = 0;
+            
+            if (juristicResults.size > 0) {
+                console.log(`Found ${juristicResults.size} juristic subscribers, writing to file...`);
+                
+                // Process and write each juristic record
+                for (const resultStr of juristicResults) {
                     try {
                         const record = JSON.parse(resultStr);
                         
@@ -832,377 +1190,634 @@ async function downloadSubscribers(config = {}) {
                             continue;
                         }
                         
-                        results['juristic'].add(resultStr);
-                        totalProcessed++;
-                        
-                        // Write valid record to file
-                        const line = Object.values(record)
-                            .map(field => `"${String(field || '').replace(/"/g, '""')}"`)
-                            .join(',') + '\n';
-                        await fs.appendFile(outputFiles['juristic'], line);
-                    } catch (error) {
-                        console.warn('Error processing juristic record:', error.message);
-                        continue;
+                        // Clean values to prevent CSV corruption
+                        const cleanedValues = Object.values(record).map(value => 
+                            String(value || '').replace(/,/g, ';').replace(/[\r\n]/g, ' ')
+                        );
+                        const row = cleanedValues.join(',');
+                        // Append to file directly
+                        await fs.appendFile(filePath, row + '\n', 'utf-8');
+                        recordCount++;
+                    } catch (recordError) {
+                        console.warn('Error processing juristic record:', recordError.message);
                     }
                 }
                 
-                // Log progress
-                const elapsed = (Date.now() - startTime) / 1000;
-                console.log(`Progress: ${totalProcessed} total records processed in ${elapsed.toFixed(1)}s`);
+                console.log(`Successfully processed ${recordCount} juristic subscriber records`);
+                generatedFiles.push({
+                    type: 'juristic',
+                    status: 'ALL',
+                    path: filePath,
+                    recordCount
+                });
                 
-            } catch (error) {
-                console.error(`Error processing ${type} subscribers:`, error.message);
+                // Upload file to BDAP
+                try {
+                    await uploadToBDAP(filePath);
+                    console.log('Successfully uploaded juristic subscribers file to BDAP');
+                } catch (uploadError) {
+                    console.error('Error uploading juristic subscribers file:', uploadError.message);
+                }
+            } else {
+                console.log('No juristic subscribers found');
             }
-        }
-    }
-
-    console.log('\nProcessing completed:');
-    console.log('- Natural Subscribers:');
-    for (const state of verificationStates) {
-        console.log(`  - ${state}: ${results[`natural_${state}`].size} records`);
-    }
-    console.log(`- Juristic Subscribers: ${results['juristic'].size} records`);
-    console.log(`- Total records: ${totalProcessed}`);
-    
-    // Upload all files to BDAP
-    console.log('\nUploading files to BDAP server...');
-    for (const [type, file] of Object.entries(outputFiles)) {
-        try {
-            console.log(`Uploading ${type} file...`);
-            await uploadToBDAP(file);
-            console.log(`Successfully uploaded ${type} file`);
+            
         } catch (error) {
-            console.error(`Error uploading ${type} file:`, error.message);
+            console.error('Critical error processing juristic subscribers:', error.message);
+            await safeSendNotification('Failed to download juristic subscribers - contact support', notificationContact);
         }
     }
     
-    return true;
+    // Print summary of all generated files
+    console.log('\n====== DOWNLOAD SUMMARY ======');
+    let totalRecords = 0;
+    
+    for (const file of generatedFiles) {
+        console.log(`${file.type.toUpperCase()} ${file.status}: ${file.recordCount} records`);
+        totalRecords += file.recordCount;
+    }
+    
+    console.log(`Total records processed: ${totalRecords}`);
+    console.log('==============================');
+    
+    return generatedFiles;
 }
 
 /**
- * Schedules the weekly download job using node-cron
- * Runs every Monday at 2 AM
+ * Downloads all juristic subscribers
+ * @returns {Promise<string[]>} Paths to the generated files
+ */
+async function downloadJuristicSubscribers() {
+    console.log('Starting juristic subscriber download...');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let results = [];
+    
+    try {
+        // Create output path
+        const outputPath = await getDatePartitionedPath();
+        const outputFilename = `juristic_all_${timestamp}.csv`;
+        const filePath = path.join(outputPath, outputFilename);
+        
+        // Initialize CSV file with appropriate header
+        const juristicHeader = 'msisdn,subscriber_id,subscriber_type,number_state,subscriber_verification_state,subscriber_verification_reason,first_name,last_name,date_of_birth,registration_date,registration_number,country,sex,document_type,document_number,document_issue_date,document_expiry_date,address_plot,address_city,created_date,updated_date';
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, juristicHeader + '\n', 'utf-8');
+        
+        console.log(`Starting download for juristic subscribers to ${DEFAULT_CONTACT}`);
+        
+        // Fetch juristic subscribers
+        console.log('Fetching all juristic subscribers...');
+        const juristicResults = await fetchAllSubscribers(null, 'juristic');
+        let recordCount = 0;
+        
+        if (juristicResults.size > 0) {
+            console.log(`Found ${juristicResults.size} juristic subscribers, writing to file...`);
+            
+            // Process and write each juristic record
+            for (const resultStr of juristicResults) {
+                try {
+                    const record = JSON.parse(resultStr);
+                    
+                    // Validate required fields
+                    if (!record.msisdn || !record.registration_number) {
+                        console.warn('Skipping malformed juristic record:', JSON.stringify({
+                            msisdn: record.msisdn,
+                            registration_number: record.registration_number
+                        }));
+                        continue;
+                    }
+                    
+                    // Clean values to prevent CSV corruption
+                    const cleanedValues = Object.values(record).map(value => 
+                        String(value || '').replace(/,/g, ';').replace(/[\r\n]/g, ' ')
+                    );
+                    const row = cleanedValues.join(',');
+                    // Append to file directly
+                    await fs.appendFile(filePath, row + '\n', 'utf-8');
+                    recordCount++;
+                } catch (recordError) {
+                    console.warn('Error processing juristic record:', recordError.message);
+                }
+            }
+            
+            console.log(`Successfully processed ${recordCount} juristic subscriber records`);
+            results.push(filePath);
+            
+            // Enable BDAP upload
+            try {
+                await uploadToBDAP(filePath);
+                console.log('Successfully uploaded juristic subscribers file to BDAP');
+            } catch (uploadError) {
+                console.error('Error uploading juristic subscribers file:', uploadError);
+            }
+        } else {
+            console.log('No juristic subscribers found');
+        }
+        
+        console.log(`\nCompleted juristic subscriber download`);
+        return results;
+        
+    } catch (error) {
+        console.error('Error in juristic subscribers download:', error);
+        console.error(`Failed to download juristic subscribers - contact support: ${error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Production version of natural subscriber download without page limits
+ * Used for scheduled weekly runs
+ * @returns {Promise<string[]>} Paths to the generated files
+ */
+async function downloadAllNaturalSubscribersProduction() {
+    console.log('Starting FULL PRODUCTION natural subscriber download...');
+    
+    // Process all verification states
+    const statusesToDownload = ['FAILED_VERIFICATION', 'PENDING_VERIFICATION', 'VERIFIED']; 
+    let results = [];
+    
+    try {
+        // Process each state with unlimited pages
+        for (const status of statusesToDownload) {
+            try {
+                console.log(`\n---------> Processing ${status} natural subscribers (FULL PRODUCTION RUN) <---------`);
+                
+                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+                const fileNamePrefix = `${status.toLowerCase()}_natural-subscriber`;
+                const filename = `${fileNamePrefix}_${timestamp}.csv`;
+                const filePath = path.join(NATURAL_OUTPUT_DIR, filename);
+
+                await safeSendNotificationNatural(`Starting FULL download for ${status} subscribers`, DEFAULT_CONTACT);
+
+                // Initialize CSV file
+                const initialRow = 'firstname,lastname,dateOfBirth,country,documentType,documentNumber,expiryDate,dateOfIssue,sex,state,updated,msisdn,naturalSubscriber,juristicSubscriber,registrationNumber,verificationReason,verificationState';
+                await writeToFileNatural(filePath, initialRow);
+
+                // Fetch initial data to get pagination details
+                const initialResponse = await withRetryNatural(() =>
+                    naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000`)
+                );
+
+                // Get actual total pages without limit
+                const totalPages = initialResponse.data.pages || MAX_PAGES_FULL;
+                console.log(`Processing ALL ${totalPages} pages of ${status} subscribers`);
+
+                // Process all pages without artificial limit
+                for (let currentPage = 0; currentPage < totalPages; currentPage++) {
+                    try {
+                        console.log(`Processing page ${currentPage + 1}/${totalPages}`);
+                        const pageData = await withRetryNatural(() =>
+                            naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000&page=${currentPage}`)
+                        );
+
+                        if (!pageData.data.content?.length) {
+                            console.log(`No content found in page ${currentPage}`);
+                            continue;
+                        }
+
+                        const records = pageData.data.content.flatMap(subscriber =>
+                            subscriber.numbers.map(number => ({
+                                firstname: subscriber.firstName,
+                                lastname: subscriber.lastName,
+                                dateOfBirth: subscriber.dateOfBirth,
+                                country: subscriber.country,
+                                documentType: subscriber.subscriberDocuments[0]?.documentType || '',
+                                documentNumber: subscriber.subscriberDocuments[0]?.documentNumber || '',
+                                expiryDate: subscriber.subscriberDocuments[0]?.expiryDate || '',
+                                dateOfIssue: subscriber.subscriberDocuments[0]?.dateOfIssue || '',
+                                sex: subscriber.sex,
+                                state: number.state,
+                                updated: subscriber.updated,
+                                msisdn: number.msisdn,
+                                naturalSubscriber: number.naturalSubscriber,
+                                juristicSubscriber: number.juristicSubscriber,
+                                registrationNumber: number.registrationNumber,
+                                verificationReason: subscriber.verificationReason,
+                                verificationState: subscriber.verificationState
+                            }))
+                        );
+
+                        records.map((record) => {
+                            const row = `${record.firstname},${record.lastname}, ${record.dateOfBirth}, ${record.country}, ${record.documentType}, ${record.documentNumber}, ${record.expiryDate},${record.dateOfIssue}, ${record.sex}, ${record.state}, ${record.updated},${record.msisdn},${record.naturalSubscriber},${record.juristicSubscriber},${record.registrationNumber},${record.verificationReason},${record.verificationState}`;
+                            writeToFileNatural(filePath, row);
+                        });
+
+                        console.log(`Processed ${records.length} records from page ${currentPage + 1}`);
+
+                    } catch (pageError) {
+                        console.error(`Error processing page ${currentPage}:`, pageError);
+                        await safeSendNotificationNatural(`Error processing page ${currentPage} for ${status} subscribers`, DEFAULT_CONTACT);
+                    }
+                }
+
+                await safeSendNotificationNatural(`Successfully downloaded ALL ${status} subscribers`, DEFAULT_CONTACT);
+                console.log(`Completed FULL download for ${status} subscribers at: ${filePath}`);
+                
+                results.push(filePath);
+                
+                // Upload to BDAP
+                try {
+                    console.log(`Uploading ${status} file to BDAP...`);
+                    await uploadToBDAP(filePath);
+                    console.log(`Successfully uploaded ${status} file to BDAP`);
+                } catch (uploadError) {
+                    console.error(`Error uploading ${status} file:`, uploadError);
+                }
+                
+            } catch (error) {
+                console.error(`Error processing ${status} natural subscribers:`, error);
+            }
+        }
+        
+        console.log(`\nCompleted FULL natural subscriber download: ${results.length} status types processed`);
+        return results;
+        
+    } catch (error) {
+        console.error('Error in FULL natural subscribers download:', error);
+        throw error;
+    }
+}
+
+/**
+ * Production version of juristic subscriber download without page limits
+ * Used for scheduled weekly runs
+ * @returns {Promise<string[]>} Paths to the generated files
+ */
+async function downloadAllJuristicSubscribersProduction() {
+    console.log('Starting FULL PRODUCTION juristic subscriber download...');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let results = [];
+    
+    try {
+        // Create output path
+        const outputPath = await getDatePartitionedPath();
+        const outputFilename = `juristic_all_${timestamp}.csv`;
+        const filePath = path.join(outputPath, outputFilename);
+        
+        // Initialize CSV file with appropriate header
+        const juristicHeader = 'msisdn,subscriber_id,subscriber_type,number_state,subscriber_verification_state,subscriber_verification_reason,first_name,last_name,date_of_birth,registration_date,registration_number,country,sex,document_type,document_number,document_issue_date,document_expiry_date,address_plot,address_city,created_date,updated_date';
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, juristicHeader + '\n', 'utf-8');
+        
+        console.log(`Starting FULL download for juristic subscribers to ${DEFAULT_CONTACT}`);
+        
+        // Fetch juristic subscribers - override MAX_PAGES with MAX_PAGES_FULL for production
+        console.log('Fetching ALL juristic subscribers without page limits...');
+        
+        // Custom implementation to fetch ALL juristic subscribers
+        const url = `/api/v1/juristic_subscribers/mno`;
+        console.log(`Using endpoint: ${url}`);
+        
+        // Initialize pagination variables
+        let currentPage = 0;
+        const pageSize = PAGE_SIZE;
+        let totalPages = 1;
+        let recordCount = 0;
+        
+        // Process pages without the testing limit
+        while (currentPage < totalPages) {
+            console.log(`Fetching page ${currentPage + 1}`);
+            const response = await api.get(url, {
+                params: {
+                    page: currentPage,
+                    size: pageSize
+                }
+            });
+            
+            // Validate response data
+            if (!response.data || response.data.error) {
+                console.error('Error response:', response.data);
+                break;
+            }
+            
+            // Process the juristic subscriber data if it has the expected structure
+            if (response.data.content && Array.isArray(response.data.content)) {
+                // Update total pages on first request
+                if (currentPage === 0) {
+                    totalPages = response.data.pages || 1;
+                    console.log(`Total pages for juristic subscribers: ${totalPages}`);
+                }
+                
+                const subscribers = response.data.content;
+                console.log(`Processing ${subscribers.length} subscribers from page ${currentPage + 1}`);
+                
+                // Process each juristic subscriber
+                for (const subscriber of subscribers) {
+                    if (subscriber.registrationNumber) {
+                        try {
+                            // Fetch additional details for this juristic subscriber
+                            const details = await api.get(`/api/v1/juristic_subscribers/registration_number/${subscriber.registrationNumber}`);
+                            
+                            // Fetch phone numbers for this juristic subscriber
+                            const numbersDetails = await api.get(`/api/v1/juristic_subscribers/numbers/${subscriber.registrationNumber}`);
+                            
+                            // Extract contact person data, handling different API response structures
+                            const contactPerson = details.data?.contactPersons && details.data.contactPersons.length > 0
+                                ? details.data.contactPersons[0]
+                                : details.data?.contactPerson || {}; // Try alternate property name
+                                
+                            // Extract document data, handling different API response structures
+                            const documents = contactPerson.documents && contactPerson.documents.length > 0
+                                ? contactPerson.documents[0]
+                                : contactPerson.document || {}; // Try alternate property name
+                            
+                            // Extract numbers data, handling different API response structures
+                            const numbers = numbersDetails.data?.numbers || 
+                                           numbersDetails.data?.msisdns || 
+                                           (Array.isArray(numbersDetails.data) ? numbersDetails.data : []);
+                            
+                            // Process each number for this juristic subscriber
+                            if (numbers && Array.isArray(numbers) && numbers.length > 0) {
+                                numbers.forEach(number => {
+                                    // Create standardized record format for each number
+                                    const record = {
+                                        msisdn: number.msisdn,
+                                        subscriber_id: subscriber.id,
+                                        subscriber_type: 'juristic',
+                                        number_state: number.status,
+                                        subscriber_verification_state: contactPerson.verificationStatus || '',
+                                        subscriber_verification_reason: contactPerson.verificationReason || '',
+                                        first_name: contactPerson.firstName || '',
+                                        last_name: contactPerson.lastName || '',
+                                        date_of_birth: contactPerson.dateOfBirth || '',
+                                        registration_date: '',
+                                        registration_number: subscriber.registrationNumber,
+                                        country: contactPerson.country || '',
+                                        sex: contactPerson.sex || '',
+                                        document_type: documents.documentType || '',
+                                        document_number: documents.documentNumber || '',
+                                        document_issue_date: documents.dateOfIssue || '',
+                                        document_expiry_date: documents.expiryDate || '',
+                                        address_plot: '',
+                                        address_city: '',
+                                        created_date: subscriber.created || '',
+                                        updated_date: subscriber.updated || ''
+                                    };
+                                    
+                                    // Clean values to prevent CSV corruption
+                                    const cleanedValues = Object.values(record).map(value => 
+                                        String(value || '').replace(/,/g, ';').replace(/[\r\n]/g, ' ')
+                                    );
+                                    const row = cleanedValues.join(',');
+                                    
+                                    // Append to file directly
+                                    fs.appendFile(filePath, row + '\n', 'utf-8');
+                                    recordCount++;
+                                });
+                            }
+                        } catch (subscriberError) {
+                            console.error(`Error processing juristic subscriber ${subscriber.registrationNumber}:`, subscriberError.message);
+                        }
+                    }
+                }
+                
+                currentPage++;
+                console.log(`Processed ${recordCount} total juristic records so far`);
+                
+            } else {
+                // Handle unexpected response structure
+                console.log('No content array in response or unexpected structure');
+                console.log('Response keys:', Object.keys(response.data));
+                break;
+            }
+        }
+        
+        console.log(`Successfully processed ${recordCount} juristic subscriber records`);
+        results.push(filePath);
+        
+        // Upload file to BDAP
+        try {
+            await uploadToBDAP(filePath);
+            console.log('Successfully uploaded FULL juristic subscribers file to BDAP');
+        } catch (uploadError) {
+            console.error('Error uploading juristic subscribers file:', uploadError);
+        }
+        
+        console.log(`\nCompleted FULL juristic subscriber download`);
+        return results;
+        
+    } catch (error) {
+        console.error('Error in FULL juristic subscribers download:', error);
+        console.error(`Failed to download juristic subscribers - contact support: ${error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Schedules weekly download of both natural and juristic subscriber data
+ * Runs every Monday at 2 AM with full data download (no page limits)
  */
 function scheduleWeeklyDownload() {
-    console.log('Scheduling weekly download for Mondays at 2 AM...');
+    console.log('Scheduling FULL DATA weekly download for Mondays at 2 AM...');
     cron.schedule('0 2 * * 1', async () => {
-        console.log('Starting scheduled download at:', new Date().toISOString());
+        console.log('Starting scheduled FULL DATA download at:', new Date().toISOString());
         try {
-            await downloadSubscribers();
-            console.log('Scheduled download completed successfully');
+            // Download ALL natural subscribers without page limit
+            console.log('Downloading ALL natural subscribers without page limit...');
+            await downloadAllNaturalSubscribersProduction();
+            console.log('FULL natural subscriber download completed successfully');
+            
+            // Download ALL juristic subscribers without page limit
+            console.log('Downloading ALL juristic subscribers without page limit...');
+            await downloadAllJuristicSubscribersProduction();
+            console.log('FULL juristic subscriber download completed successfully');
+            
+            console.log('Weekly FULL DATA scheduled download completed successfully');
         } catch (error) {
-            console.error('Scheduled download failed:', error);
+            console.error('Scheduled FULL DATA download failed:', error);
         }
     });
 }
 
 /**
- * Test function to verify the entire pipeline
- * Validates configuration, tests connectivity, and performs a download
+ * Test function focused on natural subscriber downloads
+ * @returns {Promise<boolean>} True if test successful
  */
 async function runTest() {
-    console.log('\n=== Starting Test Run ===');
     try {
-        console.log('\nBDAP Configuration:');
-        console.log('- Host:', BDAP_CONFIG.host);
-        console.log('- Port:', BDAP_CONFIG.port);
-        console.log('- Username:', BDAP_CONFIG.username);
-        console.log('- Remote Directory:', BDAP_CONFIG.remoteDir);
-
-        // Validate BDAP configuration
-        console.log('\nValidating BDAP configuration...');
-        validateBDAPConfig();
-        console.log('BDAP configuration is valid');
+        console.log('STARTING TEST RUN');
+        console.log('=================');
         
-        // First test API connectivity with specific test MSISDNs
-        console.log('\nTesting API connectivity with specific test MSISDNs...');
-        try {
-            await testAPIConnectivity();
-        } catch (error) {
-            console.warn('⚠️ API connectivity test failed, but continuing with main process:', error.message);
-        }
-
-        console.log('\nStarting historical data download...');
-        await downloadSubscribers();
-        
-        // Add direct natural subscriber download using TypeScript approach
-        console.log('\nAttempting direct download of natural subscribers using TypeScript approach...');
-        try {
-            await downloadNaturalSubscribersDirectly();
-            console.log('✓ Direct natural subscribers download completed');
-        } catch (error) {
-            console.error('❌ Direct natural subscribers download failed:', error.message);
+        // Step 1: Test API connectivity for natural subscribers
+        console.log('1. Testing API connectivity for natural subscribers...');
+        const apiConnected = await testAPIConnectivity();
+        if (!apiConnected) {
+            console.warn('⚠️ API connectivity test warning - continuing anyway');
+        } else {
+            console.log('✓ API connectivity confirmed');
         }
         
-        console.log('\n✅ Historical data download completed');
+        // Step 2: Run natural subscribers download
+        console.log('\n2. Running natural subscribers download...');
+        await downloadNaturalSubscribersDirectly();
+        console.log('✓ Natural subscribers download completed');
+        
+        // Step 3: Run juristic subscribers download
+        console.log('\n3. Running juristic subscribers download...');
+        await downloadJuristicSubscribers();
+        console.log('✓ Juristic subscribers download completed');
+        
+        console.log('\nTEST RUN COMPLETED SUCCESSFULLY');
+        console.log('==============================');
+        return true;
     } catch (error) {
-        console.error('\n❌ Test failed:', error);
-        if (error.stack) {
-            console.error('\nError stack:', error.stack);
-        }
+        console.error('\n❌ TEST FAILED:', error.message);
+        console.error('Please check the logs for more details');
+        return false;
     }
-    console.log('\n=== Test Run Complete ===\n');
 }
 
 /**
- * Tests API connectivity using predefined test MSISDNs
- * Tries different endpoint patterns to find working ones
- * @returns {string|null} Working endpoint pattern, or null if none found
+ * Tests API connectivity against the BOCRA SIMS API
+ * Modified to test only natural subscriber verification endpoint
+ * @returns {Promise<boolean>} True if connectivity test is successful
  */
 async function testAPIConnectivity() {
-    console.log('Testing API connectivity with predefined test MSISDNs...');
-    
-    // Test with specific MSISDNs we know exist
-    const testMSISDNs = [TEST_MSISDN]; // Using the predefined TEST_MSISDN
-    
-    // Also try a few endpoints to see which one works
-    const testEndpoints = [
-        `/api/v1/subscribers/msisdn/${TEST_MSISDN}`,
-        `/api/v1/natural_subscribers/msisdn/${TEST_MSISDN}`,
-        `/api/v1/sim/lookup/${TEST_MSISDN}`,
-        `/api/v1/subscribers/lookup/${TEST_MSISDN}`,
-        `/api/v1/subscriber/msisdn/${TEST_MSISDN}`,
-        `/api/v1/natural_subscribers/details/msisdn/${TEST_MSISDN}`
-    ];
-    
-    console.log(`Testing endpoints with MSISDN ${TEST_MSISDN}...`);
-    
-    // Try each endpoint
-    for (const endpoint of testEndpoints) {
-        try {
-            console.log(`\nTrying endpoint: ${endpoint}`);
-            const response = await api.get(endpoint);
-            
-            console.log('Response status:', response.status);
-            if (response.data) {
-                console.log('Response has data:', {
-                    dataKeys: Object.keys(response.data),
-                    isArray: Array.isArray(response.data),
-                    hasError: !!response.data.error,
-                    status: response.data.status
-                });
-                
-                // If this seems like a valid subscriber response, log more details
-                if (!response.data.error && response.status === 200) {
-                    console.log('✅ Found working endpoint:', endpoint);
-                    console.log('Subscriber data sample:', JSON.stringify(response.data, null, 2).substring(0, 500) + '...');
-                    
-                    // Save this endpoint for future use
-                    console.log('RECOMMENDED: Use this endpoint pattern for natural subscribers');
-                    return endpoint;
-                }
-            } else {
-                console.log('❌ No data in response');
-            }
-        } catch (error) {
-            console.log(`❌ Endpoint ${endpoint} failed:`, {
-                status: error.response?.status,
-                message: error.message,
-                data: error.response?.data
-            });
+    console.log('Testing API connectivity for natural subscribers verification...');
+    try {
+        // Test only the /natural_subscribers/mno/verification endpoint
+        // This is the only endpoint we need for natural subscriber downloads
+        const testUrl = `${NATURAL_BASE_URL}/VERIFIED${DATE_RANGE}?size=1`;
+        
+        console.log(`Testing endpoint: ${testUrl}`);
+        const response = await naturalApiClient.get(testUrl);
+        
+        if (response.status === 200) {
+            console.log('✓ Natural subscribers verification endpoint test successful');
+            return true;
+        } else {
+            console.error(`❌ Endpoint test failed with status: ${response.status}`);
+            return false;
         }
+    } catch (error) {
+        console.error('❌ API connectivity test failed:', error.message);
+        return false;
     }
-    
-    console.log('\n⚠️ Warning: No working endpoint found for natural subscribers with MSISDN lookup');
-    console.log('Continuing with direct verification endpoint methods...');
-    return null;
 }
 
 /**
- * Direct implementation of natural subscriber download
- * Uses the same approach as the TypeScript implementation
+ * Downloads all natural subscribers directly
+ * This is the main function for natural subscriber downloads
+ * @returns {Promise<string[]>} Paths to the generated files
  */
 async function downloadNaturalSubscribersDirectly() {
-    console.log('Starting direct natural subscriber download...');
+    console.log('Starting natural subscriber download...');
     
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const partitionPath = await getDatePartitionedPath();
+    // Process all verification states
+    const statusesToDownload = ['FAILED_VERIFICATION', 'PENDING_VERIFICATION', 'VERIFIED']; 
+    let results = [];
     
-    // Convert date format for API (YYYY-MM-DD to MM-DD-YYYY)
-    const formatDateForApi = (dateStr) => {
-        const [year, month, day] = dateStr.split('-');
-        return `${month}-${day}-${year}`;
-    };
-    
-    const startDate = formatDateForApi(HISTORICAL_START_DATE);
-    const endDate = formatDateForApi(HISTORICAL_END_DATE);
-    const dateRange = `/start/${startDate}/end/${endDate}`;
-    
-    // CSV header for natural subscribers
-    const header = [
-        'firstname',
-        'lastname',
-        'dateOfBirth',
-        'country',
-        'documentType',
-        'documentNumber',
-        'expiryDate',
-        'dateOfIssue',
-        'sex',
-        'state',
-        'updated',
-        'msisdn',
-        'naturalSubscriber',
-        'juristicSubscriber',
-        'registrationNumber',
-        'verificationReason',
-        'verificationState'
-    ].join(',') + '\n';
-    
-    // Subscriber states to process
-    const states = {
-        'VERIFIED': 'verified_natural-subscriber',
-        'FAILED_VERIFICATION': 'failed_natural-subscriber',
-        'PENDING_VERIFICATION': 'pending_natural-subscriber'
-    };
-    
-    const outputFiles = {};
-    let totalProcessed = 0;
-    
-    // Create output files for each state
-    for (const [state, filePrefix] of Object.entries(states)) {
-        const filePath = path.join(partitionPath, `${filePrefix}_${timestamp}.csv`);
-        outputFiles[state] = filePath;
-        await fs.writeFile(filePath, header);
-        console.log(`Created file for ${state} natural subscribers:`, filePath);
-    }
-    
-    // Process each state
-    for (const [state, filePrefix] of Object.entries(states)) {
-        console.log(`\n========== Processing ${state} natural subscribers using direct approach ==========`);
-        
-        try {
-            // Build URL exactly like TypeScript code
-            const url = `${NATURAL_API_URL}/${state}${dateRange}`;
-            console.log(`Using URL: ${url}`);
-            
-            // Get initial response to determine pagination
-            const initialResponse = await api.get(url, {
-                params: {
-                    size: 2000
-                },
-                timeout: 60000 // 60s timeout
-            });
-            
-            if (!initialResponse.data) {
-                console.warn(`No data returned for ${state}`);
-                continue;
-            }
-            
-            // Log first response structure
-            console.log(`Response structure for ${state}:`, {
-                hasContent: !!initialResponse.data.content,
-                contentIsArray: Array.isArray(initialResponse.data.content),
-                contentLength: Array.isArray(initialResponse.data.content) ? initialResponse.data.content.length : 'N/A',
-                totalPages: initialResponse.data.pages || 0,
-                keys: Object.keys(initialResponse.data)
-            });
-            
-            const totalPages = initialResponse.data.pages || 1;
-            console.log(`Total pages for ${state}: ${totalPages}`);
-            
-            // Process up to MAX_PAGES pages
-            const pagesToProcess = Math.min(totalPages, MAX_PAGES);
-            console.log(`Will process ${pagesToProcess} pages for ${state}`);
-            
-            let stateRecords = 0;
-            
-            // Process each page
-            for (let currentPage = 0; currentPage < pagesToProcess; currentPage++) {
-                console.log(`Fetching page ${currentPage + 1}/${pagesToProcess} for ${state}...`);
-                
-                const pageResponse = currentPage === 0 ? initialResponse : 
-                    await api.get(url, {
-                        params: {
-                            size: 2000,
-                            page: currentPage
-                        },
-                        timeout: 60000
-                    });
-                
-                if (!pageResponse.data.content || !Array.isArray(pageResponse.data.content)) {
-                    console.warn(`No content array in page ${currentPage + 1}`);
-                    continue;
-                }
-                
-                const subscribers = pageResponse.data.content;
-                console.log(`Processing ${subscribers.length} subscribers from page ${currentPage + 1}`);
-                
-                // Using exact logic from TypeScript code
-                const records = subscribers.flatMap(subscriber =>
-                    subscriber.numbers.map(number => ({
-                        firstname: subscriber.firstName || '',
-                        lastname: subscriber.lastName || '',
-                        dateOfBirth: subscriber.dateOfBirth || '',
-                        country: subscriber.country || '',
-                        documentType: subscriber.subscriberDocuments?.[0]?.documentType || '',
-                        documentNumber: subscriber.subscriberDocuments?.[0]?.documentNumber || '',
-                        expiryDate: subscriber.subscriberDocuments?.[0]?.expiryDate || '',
-                        dateOfIssue: subscriber.subscriberDocuments?.[0]?.dateOfIssue || '',
-                        sex: subscriber.sex || '',
-                        state: number.state || '',
-                        updated: subscriber.updated || '',
-                        msisdn: number.msisdn || '',
-                        naturalSubscriber: number.naturalSubscriber || '',
-                        juristicSubscriber: number.juristicSubscriber || '',
-                        registrationNumber: number.registrationNumber || '',
-                        verificationReason: subscriber.verificationReason || '',
-                        verificationState: subscriber.verificationState || ''
-                    }))
-                );
-                
-                // Write records to file
-                for (const record of records) {
-                    const row = Object.values(record)
-                        .map(field => `"${String(field || '').replace(/"/g, '""')}"`)
-                        .join(',') + '\n';
-                    await fs.appendFile(outputFiles[state], row);
-                    stateRecords++;
-                    totalProcessed++;
-                }
-                
-                console.log(`Processed ${stateRecords} records for ${state} so far`);
-            }
-            
-            console.log(`Completed ${state}: ${stateRecords} records`);
-            
-        } catch (error) {
-            console.error(`Error processing ${state}:`, error.message);
-            if (error.response) {
-                console.error('Error details:', {
-                    status: error.response.status,
-                    data: error.response.data,
-                    headers: error.response.headers
+    try {
+        // Process each state using the exact approach from server_2.js
+        for (const status of statusesToDownload) {
+            try {
+                console.log(`\n---------> Processing ${status} natural subscribers <---------`);
+                const filePath = await downloadNaturalSubscribers({
+                    status,
+                    fileNamePrefix: `${status.toLowerCase()}_natural-subscriber`,
+                    notificationContact: DEFAULT_CONTACT
                 });
+                
+                if (filePath) {
+                    results.push(filePath);
+                    
+                    // Enable BDAP upload
+                    try {
+                        console.log(`Uploading ${status} file to BDAP...`);
+                        await uploadToBDAP(filePath);
+                        console.log(`Successfully uploaded ${status} file to BDAP`);
+                    } catch (uploadError) {
+                        console.error(`Error uploading ${status} file:`, uploadError);
+                    }
+                }
+            } catch (error) {
+                console.error(`Error processing ${status} natural subscribers:`, error);
             }
         }
-    }
-    
-    console.log(`\nCompleted direct natural subscriber download: ${totalProcessed} total records`);
-    
-    // Upload the files to BDAP
-    console.log('\nUploading natural subscriber files to BDAP server...');
-    for (const [state, filePath] of Object.entries(outputFiles)) {
-        try {
-            console.log(`Uploading ${state} file...`);
-            await uploadToBDAP(filePath);
-            console.log(`Successfully uploaded ${state} file`);
-        } catch (error) {
-            console.error(`Error uploading ${state} file:`, error.message);
-        }
+        
+        console.log(`\nCompleted natural subscriber download: ${results.length} status types processed`);
+        return results;
+        
+    } catch (error) {
+        console.error('Error in natural subscribers download:', error);
+        throw error;
     }
 }
 
-// Entry point - runs when the script is executed directly
-const isMainModule = process.argv[1] && process.argv[1].endsWith('Server.js');
-if (isMainModule) {
-    console.log('Running in standalone mode');
+// Run natural subscriber download for all statuses immediately
+console.log('Starting immediate natural subscriber download...');
+const statusesToDownload = ['FAILED_VERIFICATION', 'PENDING_VERIFICATION', 'VERIFIED'];
+statusesToDownload.forEach(async (status) => {
+    try {
+        await downloadNaturalSubscribers({
+            status: status,
+            fileNamePrefix: status.toLowerCase() + '_natural-subscriber',
+            notificationContact: "+26773001762"
+        });
+    } catch (error) {
+        console.error(`Error downloading ${status} natural subscribers:`, error);
+    }
+});
+
+/**
+ * Test function for production-level full data download
+ * @returns {Promise<boolean>} True if test successful
+ */
+async function runProductionTest() {
+    try {
+        console.log('STARTING PRODUCTION TEST RUN');
+        console.log('============================');
+        
+        // Step 1: Test API connectivity for natural subscribers
+        console.log('1. Testing API connectivity for natural subscribers...');
+        const apiConnected = await testAPIConnectivity();
+        if (!apiConnected) {
+            console.warn('⚠️ API connectivity test warning - continuing anyway');
+        } else {
+            console.log('✓ API connectivity confirmed');
+        }
+        
+        // Step 2: Run FULL natural subscribers download without page limits
+        console.log('\n2. Running FULL natural subscribers download...');
+        await downloadAllNaturalSubscribersProduction();
+        console.log('✓ FULL natural subscribers download completed');
+        
+        // Step 3: Run FULL juristic subscribers download without page limits
+        console.log('\n3. Running FULL juristic subscribers download...');
+        await downloadAllJuristicSubscribersProduction();
+        console.log('✓ FULL juristic subscribers download completed');
+        
+        console.log('\nPRODUCTION TEST RUN COMPLETED SUCCESSFULLY');
+        console.log('==========================================');
+        return true;
+    } catch (error) {
+        console.error('\n❌ PRODUCTION TEST FAILED:', error.message);
+        console.error('Please check the logs for more details');
+        return false;
+    }
+}
+
+// Add commandline argument support to run production test
+if (process.argv.includes('--production')) {
+    console.log('Running in production mode with FULL data download');
+    runProductionTest().catch(console.error);
+    scheduleWeeklyDownload();
+} else if (isMainModule) {
+    console.log('Running in standard test mode (limited pages)');
     runTest().catch(console.error);
-    // Also start the scheduled task
     scheduleWeeklyDownload();
 } else {
     console.log('Running as a module');
 }
 
 // Export functions for external use
-export { downloadSubscribers, scheduleWeeklyDownload, runTest };
+export { 
+    downloadNaturalSubscribers,
+    downloadNaturalSubscribersDirectly,
+    downloadJuristicSubscribers,
+    downloadAllNaturalSubscribersProduction,
+    downloadAllJuristicSubscribersProduction,
+    scheduleWeeklyDownload, 
+    runTest,
+    runProductionTest
+};
