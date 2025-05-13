@@ -138,20 +138,18 @@ async function downloadNaturalSubscribers(config) {
 
         // Fetch initial data to get pagination details
         const initialResponse = await withRetryNatural(() =>
-            naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=20`)
-            // naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000`)
+            naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000`)
         );
 
-        const totalPages = 3;
-        // const totalPages = initialResponse.data.pages;
-        console.log(`Processing ${totalPages} pages of ${status} subscribers`);
+        // Use actual total pages from API response instead of hardcoded value
+        const totalPages = initialResponse.data.pages || 1;
+        console.log(`Processing ${totalPages} pages of ${status} subscribers (FULL DATA)`);
 
         // Process all pages
         for (let currentPage = 0; currentPage < totalPages; currentPage++) {
             try {
                 console.log(`Processing page ${currentPage + 1}/${totalPages}`);
                 const pageData = await withRetryNatural(() =>
-                    // naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=20&page=${currentPage}`)
                     naturalApiClient.get(`${NATURAL_BASE_URL}/${status}${DATE_RANGE}?size=2000&page=${currentPage}`)
                 );
 
@@ -1144,7 +1142,7 @@ async function downloadSubscribers(config = {}) {
                     await uploadToBDAP(filePath);
                     console.log(`Successfully uploaded ${status} natural subscribers file to BDAP`);
                 } catch (uploadError) {
-                    console.error(`Error uploading ${status} natural subscribers file:`, uploadError.message);
+                    console.error(`Error uploading ${status} natural subscribers file:`, uploadError);
                 }
                 
             } catch (error) {
@@ -1216,7 +1214,7 @@ async function downloadSubscribers(config = {}) {
                     await uploadToBDAP(filePath);
                     console.log('Successfully uploaded juristic subscribers file to BDAP');
                 } catch (uploadError) {
-                    console.error('Error uploading juristic subscribers file:', uploadError.message);
+                    console.error('Error uploading juristic subscribers file:', uploadError);
                 }
             } else {
                 console.log('No juristic subscribers found');
@@ -1303,7 +1301,7 @@ async function downloadJuristicSubscribers() {
             console.log(`Successfully processed ${recordCount} juristic subscriber records`);
             results.push(filePath);
             
-            // Enable BDAP upload
+            // Upload file to BDAP
             try {
                 await uploadToBDAP(filePath);
                 console.log('Successfully uploaded juristic subscribers file to BDAP');
@@ -1605,28 +1603,82 @@ async function downloadAllJuristicSubscribersProduction() {
 
 /**
  * Schedules weekly download of both natural and juristic subscriber data
- * Runs every Monday at 2 AM with full data download (no page limits)
+ * Runs every Monday at 1 AM with full data download (no page limits)
  */
 function scheduleWeeklyDownload() {
-    console.log('Scheduling FULL DATA weekly download for Mondays at 2 AM...');
-    cron.schedule('0 2 * * 1', async () => {
+    console.log('Scheduling FULL DATA weekly download for Mondays at 1 AM...');
+    cron.schedule('0 1 * * 1', async () => {
         console.log('Starting scheduled FULL DATA download at:', new Date().toISOString());
         try {
-            // Download ALL natural subscribers without page limit
-            console.log('Downloading ALL natural subscribers without page limit...');
-            await downloadAllNaturalSubscribersProduction();
-            console.log('FULL natural subscriber download completed successfully');
+            // Process all verification states for natural subscribers
+            const statusesToDownload = ['FAILED_VERIFICATION', 'PENDING_VERIFICATION', 'VERIFIED'];
+            let naturalResults = [];
             
-            // Download ALL juristic subscribers without page limit
-            console.log('Downloading ALL juristic subscribers without page limit...');
-            await downloadAllJuristicSubscribersProduction();
-            console.log('FULL juristic subscriber download completed successfully');
+            console.log('***** DOWNLOADING NATURAL SUBSCRIBERS (ALL VERIFICATION STATES) *****');
+            
+            for (const status of statusesToDownload) {
+                try {
+                    console.log(`\n---------> Processing ${status} natural subscribers <---------`);
+                    const filePath = await downloadNaturalSubscribers({
+                        status,
+                        fileNamePrefix: `${status.toLowerCase()}_natural-subscriber`,
+                        notificationContact: DEFAULT_CONTACT
+                    });
+                    
+                    if (filePath) {
+                        naturalResults.push(filePath);
+                        
+                        // Upload to BDAP
+                        try {
+                            console.log(`Uploading ${status} natural subscribers file to BDAP...`);
+                            await uploadToBDAP(filePath);
+                            console.log(`Successfully uploaded ${status} natural subscribers file to BDAP`);
+                        } catch (uploadError) {
+                            console.error(`Error uploading ${status} natural subscribers file:`, uploadError);
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error processing ${status} natural subscribers:`, error);
+                }
+            }
+            
+            console.log(`\nCompleted natural subscriber download: ${naturalResults.length} status types processed`);
+            
+            // Download juristic subscribers
+            console.log('\n***** DOWNLOADING JURISTIC SUBSCRIBERS *****');
+            try {
+                const juristicFilePath = await downloadJuristicSubscribers();
+                
+                if (juristicFilePath) {
+                    // Upload to BDAP
+                    try {
+                        console.log('Uploading juristic subscribers file to BDAP...');
+                        await uploadToBDAP(juristicFilePath);
+                        console.log('Successfully uploaded juristic subscribers file to BDAP');
+                    } catch (uploadError) {
+                        console.error('Error uploading juristic subscribers file:', uploadError);
+                    }
+                }
+                
+                console.log('Juristic subscriber download completed successfully');
+            } catch (error) {
+                console.error('Error processing juristic subscribers:', error);
+            }
+            
+            // Send notification that weekly download is complete
+            await safeSendNotificationNatural(`Weekly BOCRA data sync completed. Processed ${naturalResults.length} natural verification states and juristic subscribers.`, DEFAULT_CONTACT);
             
             console.log('Weekly FULL DATA scheduled download completed successfully');
         } catch (error) {
             console.error('Scheduled FULL DATA download failed:', error);
+            await safeSendNotificationNatural(`Weekly BOCRA data sync failed: ${error.message}`, DEFAULT_CONTACT);
         }
+    }, {
+        scheduled: true,
+        timezone: "Africa/Gaborone" // Use Botswana timezone
     });
+    
+    console.log('Weekly data sync scheduled for Mondays at 1 AM Botswana time');
 }
 
 /**
@@ -1802,13 +1854,70 @@ if (process.argv.includes('--production')) {
     console.log('Running in production mode with FULL data download');
     runProductionTest().catch(console.error);
     scheduleWeeklyDownload();
-} else if (isMainModule) {
+} else if (import.meta.url === `file://${process.argv[1]}`) {
     console.log('Running in standard test mode (limited pages)');
     runTest().catch(console.error);
     scheduleWeeklyDownload();
 } else {
     console.log('Running as a module');
 }
+
+/**
+ * Executes a one-time immediate push of all BOCRA subscriber data (all 3 states) to BDAP server
+ */
+function scheduleOnePushToBDAP() {
+    console.log(`Starting immediate push of all BOCRA subscriber data...`);
+    
+    // Process all verification states immediately instead of scheduling
+    (async () => {
+        try {
+            console.log('Starting immediate push of all BOCRA subscriber data at:', new Date().toISOString());
+            
+            // Process all verification states
+            const statusesToDownload = ['FAILED_VERIFICATION', 'PENDING_VERIFICATION', 'VERIFIED'];
+            let results = [];
+            
+            for (const status of statusesToDownload) {
+                try {
+                    console.log(`\n---------> Processing ${status} natural subscribers <---------`);
+                    const filePath = await downloadNaturalSubscribers({
+                        status,
+                        fileNamePrefix: `${status.toLowerCase()}_natural-subscriber`,
+                        notificationContact: DEFAULT_CONTACT
+                    });
+                    
+                    if (filePath) {
+                        results.push(filePath);
+                        
+                        // Upload to BDAP
+                        try {
+                            console.log(`Uploading ${status} file to BDAP...`);
+                            await uploadToBDAP(filePath);
+                            console.log(`Successfully uploaded ${status} file to BDAP`);
+                        } catch (uploadError) {
+                            console.error(`Error uploading ${status} file:`, uploadError);
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error processing ${status} natural subscribers:`, error);
+                }
+            }
+            
+            // Send notification that all files have been processed
+            await safeSendNotificationNatural(`BOCRA data push completed. Processed ${results.length} status types with FULL data.`, DEFAULT_CONTACT);
+            console.log(`\nCompleted immediate push of BOCRA subscriber data: ${results.length} status types processed`);
+            
+        } catch (error) {
+            console.error('Immediate push failed:', error);
+            await safeSendNotificationNatural(`BOCRA data push failed: ${error.message}`, DEFAULT_CONTACT);
+        }
+    })();
+    
+    console.log(`Immediate push initiated`);
+}
+
+// Schedule the one-time push
+scheduleOnePushToBDAP();
 
 // Export functions for external use
 export { 
