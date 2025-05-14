@@ -36,4 +36,15 @@ lerna-debug.log*
 *.ntvs*
 *.njsproj
 *.sln
-*.sw? 
+*.sw?
+
+# Resource files
+resources/
+comparison_results/
+tmp_extract/
+C1/
+Vlookup/
+
+# Output files
+*.csv
+*.txt 
